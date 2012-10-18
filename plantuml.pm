@@ -1,17 +1,18 @@
 #!/usr/bin/perl
-# graphviz plugin for ikiwiki: render graphviz source as an image.
-# Josh Triplett
-package IkiWiki::Plugin::graphviz;
+# plantuml for ikiwiki: render plantuml source as an image.
+# Rob Taylor, based off graphviz plugin by Josh Triplett
+package IkiWiki::Plugin::plantuml;
 
 use warnings;
 use strict;
 use IkiWiki 3.00;
 use IPC::Open2;
+use File::Basename;
 
 sub import {
-	hook(type => "getsetup", id => "graphviz", call => \&getsetup);
+	hook(type => "getsetup", id => "plantuml", call => \&getsetup);
 	hook(type => "needsbuild", id => "version", call => \&needsbuild);
-	hook(type => "preprocess", id => "graph", call => \&graph, scan => 1);
+	hook(type => "preprocess", id => "uml", call => \&uml, scan => 1);
 }
 
 sub getsetup () {
@@ -23,53 +24,56 @@ sub getsetup () {
 		},
 }
 
-my %graphviz_programs = (
-	"dot" => 1, "neato" => 1, "fdp" => 1, "twopi" => 1, "circo" => 1
-);
 
 sub needsbuild {
 	my $needsbuild=shift;
 	foreach my $page (keys %pagestate) {
-		if (exists $pagestate{$page}{graph} &&
+		if (exists $pagestate{$page}{uml} &&
 		    exists $pagesources{$page} &&
 		    grep { $_ eq $pagesources{$page} } @$needsbuild) {
 			# remove state, will be re-added if
-			# the graph is still there during the rebuild
-			delete $pagestate{$page}{graph};
+			# the uml is still there during the rebuild
+			delete $pagestate{$page}{uml};
 		}
 	}       
 	return $needsbuild;
 }
 
-sub render_graph (\%) {
+sub render_uml (\%) {
 	my %params = %{(shift)};
 	
-	my $src = "charset=\"utf-8\";\n";
-	$src .= "ratio=compress;\nsize=\"".($params{width}+0).", ".($params{height}+0)."\";\n"
-		if defined $params{width} and defined $params{height};
-	$src .= $params{src};
-	$src .= "}\n";
+	my $src = $params{src};
 	
 	# Use the sha1 of the graphviz code as part of its filename,
-	# and as a unique identifier for its imagemap.
 	eval q{use Digest::SHA};
 	error($@) if $@;
-	my $sha=IkiWiki::possibly_foolish_untaint(Digest::SHA::sha1_hex($params{type}.$src));
-	$src = "$params{type} graph$sha {\n".$src;
+	my $sha=IkiWiki::possibly_foolish_untaint(Digest::SHA::sha1_hex($src));
 
-	my $dest=$params{page}."/graph-".$sha.".png";
+	my $dest=$params{page}."/uml-".$sha.".png";
 	will_render($params{page}, $dest);
+	
+        $src = "\@startuml\n".
+	       "\'".urlto($dest, $params{destpage}).
+	       $src.
+	       "\@enduml\n";
 
-	my $map=$pagestate{$params{destpage}}{graph}{$sha};
-	if (! -e "$config{destdir}/$dest" || ! defined $map) {
+	print $src;
+	print $config{destdir}."\n";
+	print "$config{destdir}/$dest"."\n";
+        
+	print "jar $params{jar}";		
+
+	if (! -e "$config{destdir}/$dest") {
+		print "STOADT\n";
 		# Use ikiwiki's function to create the image file, this makes
 		# sure needed subdirs are there and does some sanity checking.
 		writefile($dest, $config{destdir}, "");
-		
+
+		print "jar $params{jar}";		
 		my $pid;
 		my $sigpipe=0;
 		$SIG{PIPE}=sub { $sigpipe=1 };
-		$pid=open2(*IN, *OUT, "$params{prog} -Tpng -o '$config{destdir}/$dest' -Tcmapx");
+		$pid=open2(*IN, *OUT, "java -jar $params{jar} -charset UTF-8 -pipe > '$config{destdir}/$dest'");
 
 		# open2 doesn't respect "use open ':utf8'"
 		binmode (IN, ':utf8');
@@ -78,72 +82,25 @@ sub render_graph (\%) {
 		print OUT $src;
 		close OUT;
 
-		local $/ = undef;
-		$map=$pagestate{$params{destpage}}{graph}{$sha}=<IN>;
 		close IN;
 
 		waitpid $pid, 0;
 		$SIG{PIPE}="DEFAULT";
-		error gettext("failed to run graphviz") if ($sigpipe || $?);
+		error gettext("failed to run java -jar $params{jar}") if ($sigpipe || $?);
 	}
 
 	return "<img src=\"".urlto($dest, $params{destpage}).
-		"\" usemap=\"#graph$sha\" />\n".
-		$map;
+		"\" />\n";
 }
 
-sub graph (@) {
+sub uml (@) {
 	my %params=@_;
+	my $key;
 
-	# Support wikilinks in the graph source.
-	my $src=$params{src};
-	$src="" unless defined $src;
-	$src=IkiWiki::linkify($params{page}, $params{destpage}, $params{src});
-	return unless defined wantarray; # scan mode short-circuit
-	if ($src ne $params{src}) {
-		# linkify makes html links, but graphviz wants plain
-		# urls. This is, frankly a hack: Process source as html,
-		# throw out everything inside tags that is not a href.
-		my $s;
-		my $nested=0;
-		use HTML::Parser;
-		error $@ if $@;
-		my $p=HTML::Parser->new(api_version => 3);
-		$p->handler(start => sub {
-			my %attrs=%{shift()};
-			if (exists $attrs{href}) {
-				if ($s=~/href\s*=\s*"$/) {
-					$s.=$attrs{href};
-				}
-				elsif ($s=~/href\s*=\s*$/) {
-					$s.="\"$attrs{href}\"";
-				}
-				else {
-					$s.="href=\"$attrs{href}\"";
-				}
-			}
-			$nested++;
-		}, "attr");
-		$p->handler(end => sub {
-			$nested--;
-		});
-		$p->handler(default => sub {
-			$s.=join("", @_) unless $nested;
-		}, "text");
-		$p->parse($src);
-		$p->eof;
-		$s=~s/\[ href= \]//g; # handle self-links
-		$params{src}=$s;
-	}
-	else {
-		$params{src}=$src;
-	}
+	print "src = " . $params{src};
+	$params{jar}=dirname($INC{"IkiWiki/Plugin/plantuml.pm"})."/plantuml.jar";
 
-	$params{type} = "digraph" unless defined $params{type};
-	$params{prog} = "dot" unless defined $params{prog};
-	error gettext("prog not a valid graphviz program") unless $graphviz_programs{$params{prog}};
-
-	return render_graph(%params);
+	return render_uml(%params);
 }
 
 1
